@@ -1,5 +1,7 @@
 # ME3ModDesc-JSON
 
+Written for Python 3.14.0
+
 A python script to convert ME3Tweaks ModManager's moddesc.ini format into .json and back.
 It is meant to be used as CLI tool.
 
