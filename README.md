@@ -10,11 +10,11 @@ Dont comment on spaghetti code, I am not a Python pro, if you wanna fix things f
 
 ## Usage:
 
-pip install -e .
+install globally with: `pip install -e .`
 
-## Commands:
-convert  Convert data from a file to another format.
-        _right now it just creates .ini from .json or vice-versa and replaces existing file if present_
-debug    Prints repr() of the parsed values from the selected file.
-echo     Prints conversion output into the console window.
-test     Run a test against a file of supported format.
+| Command | Description                                                                                                                              |
+| ------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| convert | Convert data from a file to another format.right now it just creates .ini from .json or vice-versa and replaces existing file if present |
+| debug   | Prints repr() of the parsed values from the selected file.                                                                               |
+| echo    | Prints conversion output into the console window.                                                                                        |
+| test    | Run a test against a file of supported format.                                                                                           |
