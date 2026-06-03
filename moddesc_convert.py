@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable, MutableSequence
 from dataclasses import dataclass, field, fields
 from difflib import unified_diff
+from multiprocessing import Value
 from pathlib import Path
 from rich.console import Console
 from rich.pretty import Pretty
@@ -17,6 +18,34 @@ import sys
 
 _JSON_INDENT: int = 4
 JsonValue: TypeAlias = str | dict[str, "JsonValue"] | list["JsonValue"] | None
+
+class IdKeyStore():
+    _id_none: int = -1
+    _id: dict[int, str] = {}
+    _key_none: str = 'None'
+    _key: dict[str, int] = {}
+
+    def __repr__(self) -> str:
+        return f'{self.__class__.__name__}(_id={self._id}, _key={self._key})'
+
+    def set_id(self, id: int, key: str) -> None:
+        if id <= self._id_none:
+            raise ValueError(f"Id for key '{key}' cannot be lower or equal than ({self._id_none}).")
+        if key == self._key_none:
+            raise ValueError(f"Cannot set key '{self._key_none}' for id ({id}).")
+        self._id[id] = key
+        self._key[key] = id
+    def set_key(self, key: str, id: int) -> None:
+        self.set_id(id, key)
+    def get_id(self, key: str) -> int:
+        if key in self._key.keys():
+            return self._key[key]
+        return self._id_none
+    def get_key(self, id: int) -> str:
+        if id in self._id.keys():
+            return self._id[id]
+        return self._key_none
+multilist_key_map: IdKeyStore = IdKeyStore()
 
 @dataclass
 class IFormatting(ABC):
@@ -441,6 +470,38 @@ class DlcValue(IJsonableDict, RawValue):
         return self
 
 @dataclass
+class MultilistIDValue(RawValue):
+    """Holds either ID or friendly_key value"""
+
+    @override
+    def as_ini(self, formatted: bool = True, pretty: bool = False) -> str:
+        new_value: RawValue = RawValue()
+        new_value.uses_key = self.uses_key
+        new_value.key = self.key if new_value.uses_key else self.value_as_id()
+        new_value.value = self.value_as_id()
+        return new_value.as_ini(formatted)
+    @override
+    def jsonable(self) -> JsonValue:
+        new_value: RawValue = RawValue()
+        new_value.uses_key = self.uses_key
+        new_value.key = self.key if new_value.uses_key else self.value_as_key()
+        new_value.value = self.value_as_key()
+        return new_value.jsonable()
+
+    def value_as_key(self) -> str:
+        if self.value.isdigit():
+            friendly_key: str = multilist_key_map.get_key(int(self.value))
+            if friendly_key != multilist_key_map._key_none:  # pyright: ignore[reportPrivateUsage]
+                return friendly_key
+        return self.value
+    def value_as_id(self) -> str:
+        if not self.value.isdigit():
+            id: int = multilist_key_map.get_id(self.value)
+            if id != multilist_key_map._id_none:  # pyright: ignore[reportPrivateUsage]
+                return str(id)
+        return self.value
+
+@dataclass
 class ListValue(RawValue, MutableSequence[TFormatting], Generic[TFormatting]):
     ini_separator: str = field(default=";", repr=False)
     item_type: type[TFormatting] | type[None] = type(None)
@@ -782,9 +843,20 @@ class MultiListValue(ListValue[PathValue]):
         friendly_key, comment = (ini_line.split(';', 1) + [''])[:2]
         friendly_key = friendly_key.strip()
         comment = comment.strip()
-        # set values
-        self.friendly_key = friendly_key if friendly_key else ''
+        # set comment
         self.comment = comment if comment else ''
+
+        # parse ID:
+        ms_id: int = -1
+        match = re.search(r'multilist([0-9]+)', self.key)
+        if match:
+            ms_id = int(match.group(1))
+        # set friendly_key
+        if friendly_key:
+            self.friendly_key = friendly_key
+            multilist_key_map.set_id(ms_id, self.friendly_key)
+        else:
+            self.friendly_key = ''
         return self
 
     @override
@@ -813,6 +885,12 @@ class MultiListValue(ListValue[PathValue]):
         if not key.startswith('multilist'):
             raise ValueError(f"Cannot create MultilistValue from JSON data that are not marked with multilist key, expected: 'multilistID', received: {key}")
 
+        # parse ID:
+        ms_id: int = -1
+        match = re.search(r'multilist([0-9]+)', key)
+        if match:
+            ms_id = int(match.group(1))
+
         if isinstance(json_data[key], dict):
             self.key: str = key
             data = json_data[key]
@@ -829,6 +907,7 @@ class MultiListValue(ListValue[PathValue]):
                 # set extra data:
                 if 'friendly_key' in data.keys():
                     self.friendly_key = str(data['friendly_key'])
+                    multilist_key_map.set_id(ms_id, self.friendly_key)
                 if 'comment' in data.keys():
                     self.comment = str(data['comment'])
         return self
@@ -1000,7 +1079,7 @@ class AltDlc(IFormattingDict):
     ModOperation: EOperation = field(default_factory=EOperation)
     ModAltDLC: PathValue = field(default_factory=PathValue)
     ModDestDLC: PathValue = field(default_factory=PathValue)
-    MultiListId: IntValue = field(default_factory=IntValue)
+    MultiListId: MultilistIDValue = field(default_factory=MultilistIDValue)
     MultiListRootPath: PathValue = field(default_factory=PathValue)
     FlattenMultiListOutput: BoolValue = field(default_factory=BoolValue)
     RequiredFileRelativePaths: ListValue[RawValue] = field(default_factory=lambda: ListValue[RawValue](RawValue))
@@ -1066,14 +1145,18 @@ class CustomDlc(ITaggedDict):
 
     @override
     def set_from_ini(self, ini: str | list[str]) -> Self:
-        # first pass that ignores references because they dont yet exist.
-        _ = super().set_from_ini(ini)
         if not isinstance(ini, str):
             return self
-        # second pass to find friendly names.
-        _ = self.set_friendly_names_from_ini(ini)
-        # third pass to find multilists.
+        # set multilists.
+        # multilists must be first to correctly map id=>friendly_key values
         _ = self.set_multilists_from_ini(ini)
+
+        # set common values.
+        _ = super().set_from_ini(ini)
+        # set find friendly names.
+        # friendly names depend on common values being parsed because
+        # I am using destdirs data to detect key values.
+        _ = self.set_friendly_names_from_ini(ini)
         return self
 
     def set_friendly_names_from_ini(self, ini: str) -> Self:
@@ -1150,12 +1233,16 @@ class CustomDlc(ITaggedDict):
 
     @override
     def set_from_json(self, json_data: JsonValue) -> Self:
-        # first pass
-        _ = super().set_from_json(json_data)
-        # second pass
-        _ = self.set_friendly_names_from_json(json_data)
-        # third pass
+        # set multilists.
+        # multilists must be first to correctly map id=>friendly_key values
         _ = self.set_multilists_from_json(json_data)
+
+        # set common values.
+        _ = super().set_from_json(json_data)
+        # set find friendly names.
+        # friendly names depend on common values being parsed because
+        # I am using destdirs data to detect key values.
+        _ = self.set_friendly_names_from_json(json_data)
         return self
 
     def set_friendly_names_from_json(self, json_data: JsonValue) -> Self:
@@ -1401,6 +1488,7 @@ def debug(filepath: str | None):
                     obj = ModDescParser().set_from_json(data)
 
                 console = Console(width=None)
+                console.print(Pretty(multilist_key_map, indent_size=2))
                 console.print(Pretty(obj, indent_size=2))
         else:
             echo_fail(f"Unsupported file format, can only process .ini or .json files, received: {path.suffix}")
@@ -1421,7 +1509,8 @@ Prettyfied output will be applied for readability.
 The purpose of this command is to just read the data in more accessible way.
 """)
 @click.argument("filepath", required=False)
-def echo(filepath: str | None):
+@click.option('--convert/--no-convert', default=False, help='Instead of outputing the same file format, convert to another and output that.')
+def echo(filepath: str | None, convert: bool = False):
     path: Path = get_path(filepath)
 
     if path.exists():
@@ -1431,11 +1520,23 @@ def echo(filepath: str | None):
 
                 # convert source data into another format
                 result: str = ''
+                result_format: str = 'json' if path.suffix == '.json' else 'ini'
+                lexer: str = 'None'
 
                 # INI
                 if path.suffix == '.ini':
-                    result = ModDescParser().set_from_ini(data).as_ini()
+                    parser = ModDescParser().set_from_ini(data)
+                    result = parser.as_json() if convert else parser.as_ini()
+                    result_format = 'json' if convert else 'ini'
+                    lexer = 'json' if convert else 'peg'
+                # JSON
+                elif path.suffix == '.json':
+                    parser = ModDescParser().set_from_json(data)
+                    result = parser.as_ini() if convert else parser.as_json()
+                    result_format = 'ini' if convert else 'json'
+                    lexer = 'peg' if convert else 'json'
 
+                if result_format == 'ini':
                     # make it a bit prettier:
                     lines = result.splitlines()
                     for i, line in enumerate(lines):
@@ -1451,12 +1552,8 @@ def echo(filepath: str | None):
 
                     result = '\n'.join(lines)
 
-                # JSON
-                elif path.suffix == '.json':
-                    result = ModDescParser().set_from_json(data).as_json()
-
                 console = Console(width=None)
-                console.print(Syntax(result, 'json' if path.suffix == '.json' else 'peg', word_wrap = True))
+                console.print(Syntax(result, lexer, word_wrap = True))
         else:
             echo_fail(f"Unsupported file format, can only process .ini or .json files, received: {path.suffix}")
     else:
