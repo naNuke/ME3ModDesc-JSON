@@ -10,6 +10,7 @@ from rich.pretty import Pretty
 from rich.syntax import Syntax
 from typing import Any, Generic, Self, TypeAlias, TypeVar, cast, overload, override
 import click
+import codecs
 import json
 import re
 import sys
@@ -65,7 +66,7 @@ class IFormatting(ABC):
             if isinstance(attr, IFormatting):
                 attrs[f.name] = attr
         return attrs
-    def get_field(self, name: str, by_key: bool = False) -> IFormatting | None:
+    def get_field(self, name: str) -> IFormatting | None:
         """Get classs field, must exist in serializable names."""
         if name in self.serializable_field_names() and hasattr(self, name):
             return cast(IFormatting, getattr(self, name))
@@ -258,8 +259,8 @@ class UrlValue(RawValue):
 @dataclass
 class IWrappedValue(RawValue, ABC):
     """Interface for value thats wrapped in characters, for example as key = (value)"""
-    wrapper_left: str = field(default="")
-    wrapper_right: str = field(default="")
+    wrapper_left: str = field(default="", repr=False)
+    wrapper_right: str = field(default="", repr=False)
 
     @override
     def as_ini(self, formatted: bool = True, pretty: bool = False) -> str:
@@ -283,28 +284,28 @@ class IWrappedValue(RawValue, ABC):
 @dataclass
 class StringValue(IWrappedValue, RawValue):
     """Holds one specific value that will be represented as a string value with single quotes."""
-    wrapper_left: str = field(default="'")
-    wrapper_right: str = field(default="'")
+    wrapper_left: str = field(default="'", repr=False)
+    wrapper_right: str = field(default="'", repr=False)
 
 @dataclass
 class TextValue(IWrappedValue, RawValue):
     """Holds one specific value that will be represented as a string value with double quotes."""
-    wrapper_left: str = field(default='"')
-    wrapper_right: str = field(default='"')
+    wrapper_left: str = field(default='"', repr=False)
+    wrapper_right: str = field(default='"', repr=False)
 
 @dataclass
 class TagValue(IWrappedValue, RawValue):
     """Special value type thats used only for tagging the main dictionaries in moddesc format."""
     uses_key: bool = field(default=False)
-    wrapper_left: str = field(default="[")
-    wrapper_right: str = field(default="]")
+    wrapper_left: str = field(default="[", repr=False)
+    wrapper_right: str = field(default="]", repr=False)
 
 @dataclass
 class OptionsValue(IJsonableDict, IWrappedValue, RawValue):
     """Holds arbitrary amount of values, each with their own type."""
-    ini_separator: str = field(default=",")
-    wrapper_left: str = field(default="[")
-    wrapper_right: str = field(default="]")
+    ini_separator: str = field(default=",", repr=False)
+    wrapper_left: str = field(default="[", repr=False)
+    wrapper_right: str = field(default="]", repr=False)
 
     # INI option values are separated by a comma and wrapped in [] brackets
     @override
@@ -441,7 +442,7 @@ class DlcValue(IJsonableDict, RawValue):
 
 @dataclass
 class ListValue(RawValue, MutableSequence[TFormatting], Generic[TFormatting]):
-    ini_separator: str = field(default=";")
+    ini_separator: str = field(default=";", repr=False)
     item_type: type[TFormatting] | type[None] = type(None)
     items: list[TFormatting] = field(default_factory=list[TFormatting])
 
@@ -498,6 +499,14 @@ class ListValue(RawValue, MutableSequence[TFormatting], Generic[TFormatting]):
     def reset_items(self) -> Self:
         self.items = []
         return self
+
+    def get_index_by_key(self, key: str) -> int:
+        """returns -1 if not found"""
+        return next((i for i, item in enumerate(self.items) if item.key == key), -1)
+    def get_item_by_key(self, key: str) -> TFormatting | None:
+        if self.get_index_by_key(key) < 0:
+            return None
+        return self.items[self.get_index_by_key(key)]
 
     @override
     def as_ini(self, formatted: bool = True, pretty: bool = False) -> str:
@@ -571,7 +580,7 @@ class ListValue(RawValue, MutableSequence[TFormatting], Generic[TFormatting]):
         if not json_obj:
             return self
         # flatten json keys for those that are the same name of this attr:
-        if isinstance(json_obj, dict) and json_obj[self.key]:
+        if isinstance(json_obj, dict) and self.key in json_obj.keys():
             json_obj = cast(dict[str, JsonValue], json_obj[self.key])
 
         # dictionaries?
@@ -593,7 +602,7 @@ class ListValue(RawValue, MutableSequence[TFormatting], Generic[TFormatting]):
 
 @dataclass
 class ArrayValue(ListValue[TFormatting]):
-    ini_separator: str = field(default=',')
+    ini_separator: str = field(default=',', repr=False)
     item_type: type[TFormatting] | type[None] = type(None)
     items: list[TFormatting] = field(default_factory=list[TFormatting])
 
@@ -676,7 +685,7 @@ class ArrayValue(ListValue[TFormatting]):
 
 @dataclass
 class DictValue(ListValue[TValue]):
-    ini_separator: str = field(default='\n')
+    ini_separator: str = field(default='\n', repr=False)
     item_type: type[TValue] | type[None] = type(None)
     items: list[TValue] = field(default_factory=list[TValue])
 
@@ -704,13 +713,14 @@ class DictValue(ListValue[TValue]):
         # parse ini input and append to items
         lines: list[str] = ini if isinstance(ini, list) else ini.split(self.ini_separator)
         for line in lines:
+            if not is_valid_ini_line(line):
+                continue
             new_item = self.item_type()
-            if not new_item:
-                continue
-            new_item = new_item.set_from_ini(line)
-            if new_item.is_empty():
-                continue
-            self.items.append(new_item)
+            if isinstance(new_item, IFormatting):
+                new_item = new_item.set_from_ini(line)
+                if new_item.is_empty():
+                    continue
+                self.items.append(new_item)
         return self
 
     @override
@@ -719,18 +729,22 @@ class DictValue(ListValue[TValue]):
         for item in self.items:
             if item.is_empty():
                 continue
-            result[item.key] = item.value
+            if isinstance(item, ListValue):
+                result[item.key] = item.jsonable()
+            else:
+                result[item.key] = item.value
         return result
 
 @dataclass
-class MultiListValue(DictValue[ListValue[RawValue]]):
-    ini_separator: str = field(default='\n')
-    item_type: type[ListValue[RawValue]] | type[None] = ListValue
-    items: list[ListValue[RawValue]] = field(default_factory=list)
+class MultiListValue(ListValue[PathValue]):
+    friendly_key: str = field(default='')
+    comment: str = field(default='')
+    item_type: type[PathValue] | type[None] = PathValue
+    items: list[PathValue] = field(default_factory=list)
 
     @override
     def __init__(self) -> None:
-        super().__init__(ListValue[RawValue])
+        super().__init__(PathValue)
         self.items = []
 
     @override
@@ -739,62 +753,84 @@ class MultiListValue(DictValue[ListValue[RawValue]]):
         items: list[str] = []
         for item in self.items:
             # kinda hacky but the RawValue list format returns the items as 1 = files, 2 = files, etc
-            result = 'multilist' + item.as_ini(formatted)
+            result = item.as_ini(formatted)
             items.append(result)
-        return self.ini_separator.join(items)
+        line_key = f'{self.key} = ' if formatted else f'{self.key}='
+        line_items: str = line_key + self.ini_separator.join(items)
+        line_data: str = ''
+        if self.friendly_key:
+            line_key = '; ' + line_key if formatted else ';' + line_key
+            line_friendly: str = f'{self.friendly_key}'
+            line_comment: str = ''
+            if self.comment:
+                line_comment = f' ; {self.comment}' if formatted else f';{self.comment}'
+            line_data = f'{line_key}{line_friendly}{line_comment}'
+        if line_data:
+            return f'{line_items}\n{line_data}'
+        return line_items
     @override
     def set_from_ini(self, ini: str | list[str]) -> Self:
-        # cannot map raw value into items
-        if self.item_type == type(None):
-            return self
-        _ = self.reset_items()
+        # parse incoming list as normal list
+        _ = super().set_from_ini(ini)
+        return self
 
-        # parse ini input and append to items
-        lines: list[str] = ini if isinstance(ini, list) else ini.split(self.ini_separator)
-        for line in lines:
-            new_container: ListValue[RawValue] = ListValue[RawValue](RawValue)
-            new_item: RawValue = RawValue().set_from_ini(line)
-            if new_item.is_empty():
-                continue
-            # take the key from parsed item
-            match = re.search(r'multilist([0-9]+)', new_item.key)
-            if not match:
-                continue
-            # the matched multilistID from parsed key string
-            _ = new_container.set_from_ini(line)
-            new_container.key = match.group(1)
-            self.items.append(new_container)
+    def set_data_from_ini(self, ini_line: str) -> Self:
+        ini_line = ini_line.strip()
+        # the first portion of data line is a friendly key value and second, if present, is a comment string
+        # ensure that last item is either comment or empty:
+        # split(';', 1) max 2 parts, add empty string to the end, take first 2 elements back
+        friendly_key, comment = (ini_line.split(';', 1) + [''])[:2]
+        friendly_key = friendly_key.strip()
+        comment = comment.strip()
+        # set values
+        self.friendly_key = friendly_key if friendly_key else ''
+        self.comment = comment if comment else ''
         return self
 
     @override
     def jsonable(self) -> dict[str, JsonValue]:
-        result: dict[str, JsonValue] = {}
+        items: list[JsonValue] = []
         for item in self.items:
             if item.is_empty():
                 continue
-            result[item.key] = item.jsonable()
+            jsonable: JsonValue = item.jsonable()
+            items.append(jsonable)
+        result: dict[str, JsonValue] = {
+            'friendly_key': self.friendly_key,
+            'comment': self.comment,
+            'items': items
+        }
         return result
     @override
     def set_from_json(self, json_data: JsonValue) -> Self:
+        # can only handle dicts
         if not isinstance(json_data, dict):
             return self
+        if len(json_data) != 1:
+            raise ValueError('Cannot create MultilistValue from JSON data containing more items than one.')
+        # key must begin with "multilist"
+        key: str = next(iter(json_data.keys()), '')
+        if not key.startswith('multilist'):
+            raise ValueError(f"Cannot create MultilistValue from JSON data that are not marked with multilist key, expected: 'multilistID', received: {key}")
 
-        # my json format expects 'multilists' key here which is the name
-        # of the parent dict attribute for this entry...
-        if not json_data[self.key]:
-            return self
-        json_data = cast(dict[str, JsonValue], json_data[self.key])
+        if isinstance(json_data[key], dict):
+            self.key: str = key
+            data = json_data[key]
+            if isinstance(data, dict):
+                # data must have 'items' present
+                if not 'items' in data.keys():
+                    return self
+                if not isinstance(data['items'], list):
+                    return self
 
-        # key = ID, value = array of RawValues
-        for key, value in json_data.items():
-            if not isinstance(value, list):
-                raise ValueError(f"Invalid format, JSON multilist entry needs to be an array.\n\nref: {value}")
-
-            new_container: ListValue[RawValue] = ListValue[RawValue](RawValue)
-            _ = new_container.set_from_json( value)
-            new_container.key = key
-            if not new_container.is_empty():
-                self.items.append(new_container)
+                # all is ok, use ListValue parser to process items:
+                self.value: str = codecs.decode(str(data['items']), 'unicode_escape')
+                _ = super().set_from_json(data['items'])
+                # set extra data:
+                if 'friendly_key' in data.keys():
+                    self.friendly_key = str(data['friendly_key'])
+                if 'comment' in data.keys():
+                    self.comment = str(data['comment'])
         return self
 
 # =============================================================================
@@ -812,7 +848,7 @@ class MultiListValue(DictValue[ListValue[RawValue]]):
 
 @dataclass
 class IFormattingDict(IFormatting, ABC):
-    ini_separator: str = field(default='\n')
+    ini_separator: str = field(default='\n', repr=False)
 
     @override
     def is_empty(self) -> bool:
@@ -849,10 +885,7 @@ class IFormattingDict(IFormatting, ABC):
             lines = ini
 
         for line in lines:
-            line = line.strip()
-            if not line: # empty lines
-                continue
-            if line.startswith(('#',';','[',']')): # skip commented lines or tags
+            if not is_valid_ini_line(line):
                 continue
             temp: RawValue = RawValue().set_from_ini(line)
             # parse successful
@@ -937,7 +970,7 @@ class ECondition(EnumValue):
         'COND_ALL_DLC_PRESENT',
         'COND_ALL_DLC_NOT_PRESENT',
         'COND_SPECIFIC_SIZED_FILES',
-    })
+    },repr=False)
 @dataclass
 class EOperation(EnumValue):
     items: set[str] = field(default_factory=lambda:
@@ -947,7 +980,7 @@ class EOperation(EnumValue):
         'OP_ADD_MULTILISTFILES_TO_CUSTOMDLC',
         'OP_ENABLE_TLKMERGE_OPTIONKEY',
         'OP_NOTHING'
-    })
+    },repr=False)
 @dataclass
 class EAction(EnumValue):
     items: set[str] = field(default_factory=lambda:
@@ -956,11 +989,11 @@ class EAction(EnumValue):
         'ACTION_ALLOW_SELECT_CHECKED',
         'ACTION_DISALLOW_SELECT',
         'ACTION_DISALLOW_SELECT_CHECKED'
-    })
+    },repr=False)
 
 @dataclass
 class AltDlc(IFormattingDict):
-    ini_separator: str = field(default=',')
+    ini_separator: str = field(default=',', repr=False)
 
     Condition: ECondition = field(default_factory=ECondition)
     ConditionalDLC: ListValue[DlcValue] = field(default_factory=lambda: ListValue[DlcValue](DlcValue))
@@ -1025,7 +1058,7 @@ class CustomDlc(ITaggedDict):
     sourcedirs: ListValue[PathValue] = field(default_factory=lambda: ListValue[PathValue](PathValue))
     destdirs: ListValue[PathValue] = field(default_factory=lambda: ListValue[PathValue](PathValue))
     friendlynames: DictValue[RawValue] = field(default_factory=lambda: DictValue[RawValue](RawValue))
-    multilists: MultiListValue = field(default_factory=MultiListValue)
+    multilists: DictValue[MultiListValue] = field(default_factory=lambda: DictValue[MultiListValue](MultiListValue))
     # outdated and icompatible dont need option values so I made them just RawValues
     outdatedcustomdlc: ListValue[RawValue] = field(default_factory=lambda: ListValue[RawValue](RawValue))
     incompatiblecustomdlc: ListValue[RawValue] = field(default_factory=lambda: ListValue[RawValue](RawValue))
@@ -1052,6 +1085,8 @@ class CustomDlc(ITaggedDict):
         # find values in the passed ini portion
         lines: list[str] = []
         for line in ini.split(self.ini_separator):
+            if not is_valid_ini_line(line):
+                continue
             match = re.search(r'(.*?)\s*=\s*(.+)', line)
             if not match:
                 continue
@@ -1072,24 +1107,36 @@ class CustomDlc(ITaggedDict):
 
         # find values in the passed ini portion
         lines: list[str] = []
+        data_lines: dict[str, str] = {}
         for line in ini.split(self.ini_separator):
             match = re.search(r'(multilist[0-9]+)\s*=\s*(.+)', line)
             if not match:
                 continue
             # append item to the list value
-            lines.append(line)
+            if is_valid_ini_line(line):
+                lines.append(line)
+            # this line matched multilistID pattern but is not valid line
+            # I am using commented lines to pass extra data between formats.
+            elif len(match.groups()) == 2:
+                data_lines[match.group(1)] = match.group(2)
 
         _ = self.multilists.set_from_ini(lines)
+        # send extra data over to correct multilist
+        for key, data in data_lines.items():
+            # find index by key
+            ms = self.multilists.get_item_by_key(key)
+            if ms != None:
+                _ = ms.set_data_from_ini(data)
         return self
 
     @override
     def jsonable(self) -> dict[str, JsonValue]:
         jsonable: dict[str, JsonValue] = super().jsonable()
         result: dict[str, JsonValue] = {}
-
+        keys: list[str] = ['friendlynames', 'multilists']
         try:
             for k, v in jsonable.items():
-                if k == "friendlynames" and v:
+                if k in keys and v:
                     if not isinstance(v, dict):
                         continue
                     for key, item in v.items():
@@ -1105,6 +1152,13 @@ class CustomDlc(ITaggedDict):
     def set_from_json(self, json_data: JsonValue) -> Self:
         # first pass
         _ = super().set_from_json(json_data)
+        # second pass
+        _ = self.set_friendly_names_from_json(json_data)
+        # third pass
+        _ = self.set_multilists_from_json(json_data)
+        return self
+
+    def set_friendly_names_from_json(self, json_data: JsonValue) -> Self:
         # find friendly names, they have ID's of destdirs values:
         if not isinstance(json_data, dict):
             return self
@@ -1118,6 +1172,18 @@ class CustomDlc(ITaggedDict):
         _ = self.friendlynames.set_from_json({'friendlynames': items})
         return self
 
+    def set_multilists_from_json(self, json_data: JsonValue) -> Self:
+        # get all entries that have their keys begin with "multilist":
+        if not isinstance(json_data, dict):
+            return self
+        filtered_data: dict[str, JsonValue] = {}
+        for key, value in json_data.items():
+            key = key.strip()
+            if key.startswith('multilist'):
+                filtered_data[key] = value
+        _ = self.multilists.set_from_json({'multilists': filtered_data})
+        return self
+
 # =============================================================================
 #
 # MAIN PARSER CLASS
@@ -1126,6 +1192,7 @@ class CustomDlc(ITaggedDict):
 
 @dataclass
 class ModDescParser(IFormattingDict):
+    uses_key: bool = False
     mod_manager: ModManager = field(default_factory=ModManager)
     mod_info: ModInfo = field(default_factory=ModInfo)
     updates: Updates = field(default_factory=Updates)
@@ -1189,6 +1256,21 @@ class ModDescParser(IFormattingDict):
             if isinstance(attr, IFormattingDict):
                 tag_map[attr.key] = attr
         return tag_map
+
+# =============================================================================
+#
+# HELPERS
+#
+# =============================================================================
+def is_valid_ini_line(line: str) -> bool:
+    line = line.strip()
+    # empty lines
+    if not line:
+        return False
+    # skip commented lines or tags
+    if line.startswith(('#',';','[',']')):
+        return False
+    return True
 
 # =============================================================================
 #
@@ -1414,6 +1496,8 @@ def convert(filepath: str | None):
                 elif path.suffix == '.json':
                     new_path = path.with_suffix('.ini')
                     result = ModDescParser().set_from_json(data).as_ini()
+                # append newline at the end
+                result = result + '\n'
 
                 if new_path is None:
                     echo_fail("Could not save converted file, path parse failed:")
