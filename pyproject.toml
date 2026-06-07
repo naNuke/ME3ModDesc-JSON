@@ -1,7 +1,7 @@
 [project]
-name = "moddesc"
+name = "me3mm"
 version = "1.0.0"
-description = "Mod description tool"
+description = "ME3 Tweaks Mod Manager PyTool"
 requires-python = ">=3.14.0"
 dependencies = [
     "click",
@@ -9,7 +9,7 @@ dependencies = [
 ]
 
 [project.scripts]
-moddesc = "moddesc_convert:cli"
+me3mm = "me3mmcli:cli"
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]

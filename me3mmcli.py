@@ -4,11 +4,11 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable, MutableSequence
 from dataclasses import dataclass, field, fields
 from difflib import unified_diff
-from multiprocessing import Value
 from pathlib import Path
 from rich.console import Console
 from rich.pretty import Pretty
 from rich.syntax import Syntax
+from rich.tree import Tree
 from typing import Any, Generic, Self, TypeAlias, TypeVar, cast, overload, override
 import click
 import codecs
@@ -1402,6 +1402,64 @@ def get_path(filepath: str | None = None) -> Path:
         return (script_dir / path).resolve()
     else:
         return path.resolve()
+
+def get_folder(folder: str | None = None, msg: str = 'Enter path to a folder') -> Path:
+    """
+    Resolve folder:
+    - Absolute folder path "D:/Program Files/Modding Tools/ME3TweaksModManager/mods/LE3/Children of Rannoch (LE3)/"
+    """
+
+    if not folder:
+        prompt: str = ''
+        try:
+            prompt = cast(str, click.prompt(msg, type=str))
+        except click.Abort:
+            echo_fail("Aborted by user.")
+            sys.exit(1)
+        folder = prompt
+
+    # normalize folder path
+    folder = folder.strip().strip('"').strip("'").strip('/').strip('\\')
+    # expand user folder
+    path = Path(folder).expanduser()
+
+    if not path.exists() or not path.is_dir():
+        echo_fail("Invalid folder path provided.")
+        sys.exit(1)
+
+    return path.resolve()
+
+# =============================================================================
+#
+# CONFLICTS COMMAND
+#
+# =============================================================================
+@cli.command(help="""
+Print conflicting files between two mods
+""")
+@click.argument("folder_a", type=str, required=False)
+@click.argument("folder_b", type=str, required=False)
+def conflicts(folder_a: str | None, folder_b: str | None):
+    path_a: Path = get_folder(folder_a, 'Path to mod folder A')
+    path_b: Path = get_folder(folder_b, 'Path to mod folder B')
+
+    packages_in_a: dict[str, Path] = {f.name: f for f in path_a.rglob("*.pcc") if f.is_file()}
+    packages_in_b: dict[str, Path] = {f.name: f for f in path_b.rglob("*.pcc") if f.is_file()}
+
+    conflicting_files: dict[str, Path] = {}
+    for name in packages_in_a.keys():
+        if name in packages_in_b.keys():
+            conflicting_files[name] = packages_in_a[name]
+
+    console = Console()
+    #console.print(sorted(conflicting_files.items()))
+
+    tree = Tree(f"[bold red]{path_a}:[/bold red]")
+    for item in sorted(conflicting_files.values()):
+        _ = tree.add(f"[yellow]{item.relative_to(path_a)}[/yellow]")
+    console.print(tree)
+
+    return
 
 # =============================================================================
 #
